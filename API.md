@@ -40,3 +40,7 @@ All protected endpoints use `Authorization: Bearer <JWT>`.
 
 ### Document OCR verification
 `POST /api/documents` now performs OCR/text extraction before storing a document. The registered profile name must match the name detected in the document. A mismatch returns HTTP `422` with an `Invalid file` message and the file is not stored. Image OCR uses Tesseract.js; text-based PDFs use pdf-parse.
+
+
+## Email OTP
+`POST /api/auth/register` sends the registration OTP through Resend when `RESEND_API_KEY` is configured and `EMAIL_MODE=auto`. `POST /api/access-requests/:id/decision` sends the access-authorization OTP the same way.

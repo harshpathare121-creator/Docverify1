@@ -18,17 +18,10 @@ const PORT = Number(process.env.PORT || 10000);
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const JWT_SECRET = process.env.JWT_SECRET || crypto.createHash('sha256').update('connectid-local-demo-secret').digest('hex');
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
-const EMAIL_MODE = process.env.RESEND_API_KEY ? 'resend' : (process.env.EMAIL_MODE || 'demo');
-const RESEND_FROM = process.env.RESEND_FROM || 'ConnectID <onboarding@resend.dev>';
-async function sendOtpEmail(to, otp, purpose='verification') {
-  if (!process.env.RESEND_API_KEY) return false;
-  const subject = purpose === 'access' ? 'ConnectID access approval OTP' : 'ConnectID email verification OTP';
-  const intro = purpose === 'access' ? 'An organization is completing an approved ConnectID data-access request.' : 'Use this code to verify your ConnectID account.';
-  const html = `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto"><h2>ConnectID</h2><p>${intro}</p><p style="font-size:30px;font-weight:700;letter-spacing:8px">${otp}</p><p>This code expires in ${OTP_TTL_MINUTES} minutes.</p><p>If you did not request this, you can ignore this email.</p></div>`;
-  const r = await fetch('https://api.resend.com/emails', { method:'POST', headers:{'Authorization':`Bearer ${process.env.RESEND_API_KEY}`,'Content-Type':'application/json'}, body:JSON.stringify({from:RESEND_FROM,to:[to],subject,html,text:`${intro} Your ConnectID OTP is ${otp}. It expires in ${OTP_TTL_MINUTES} minutes.`}) });
-  if (!r.ok) { const body = await r.text(); throw new Error(`Resend email failed: ${body.slice(0,300)}`); }
-  return true;
-}
+const EMAIL_MODE = String(process.env.EMAIL_MODE || 'auto').trim().toLowerCase();
+const RESEND_API_KEY = String(process.env.RESEND_API_KEY || '').trim();
+const RESEND_FROM = String(process.env.RESEND_FROM || 'ConnectID <onboarding@resend.dev>').trim();
+const RESEND_ENABLED = Boolean(RESEND_API_KEY) && EMAIL_MODE !== 'demo';
 const OTP_TTL_MINUTES = Number(process.env.OTP_TTL_MINUTES || 10);
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -84,6 +77,38 @@ async function extractDocumentText(filePath,mimetype){
   if(mimetype==='application/pdf'){ const parser=new PDFParse({data:fs.readFileSync(filePath)}); try{ const result=await parser.getText({first:3}); return {text:result.text||'',method:'PDF text extraction'}; } finally { await parser.destroy(); } }
   const worker=await getOcrWorker(); const result=await worker.recognize(filePath); return {text:result.data.text||'',method:'Tesseract OCR'};
 }
+async function sendOtpEmail({to,otp,purpose,name}) {
+  if (!RESEND_ENABLED) return {sent:false,mode:'demo'};
+  const purposeLabel = purpose === 'register' ? 'Gmail verification' : 'data-access authorization';
+  const subject = purpose === 'register' ? 'ConnectID verification code' : 'ConnectID access authorization code';
+  const safeName = String(name || 'there').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;padding:24px;color:#122033">
+      <h2 style="margin-bottom:8px">ConnectID</h2>
+      <p>Hello ${safeName},</p>
+      <p>Your ${purposeLabel} code is:</p>
+      <div style="font-size:32px;font-weight:800;letter-spacing:8px;padding:18px;border:1px solid #d8e2ee;border-radius:12px;text-align:center">${otp}</div>
+      <p>This code expires in ${OTP_TTL_MINUTES} minutes. If you did not request this code, you can ignore this email.</p>
+      <p style="color:#66758a;font-size:12px">ConnectID demo</p>
+    </div>`;
+  const text = `ConnectID\n\nYour ${purposeLabel} code is: ${otp}\n\nThis code expires in ${OTP_TTL_MINUTES} minutes.`;
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${RESEND_API_KEY}`
+    },
+    body: JSON.stringify({from:RESEND_FROM,to:[to],subject,html,text})
+  });
+  let body = {};
+  try { body = await response.json(); } catch {}
+  if (!response.ok) {
+    const detail = body?.message || body?.error || `Resend HTTP ${response.status}`;
+    throw new Error(String(detail));
+  }
+  return {sent:true,mode:'resend',id:body?.id || null};
+}
+
 const rateBuckets=new Map();
 function rateLimit(key,limit=30,windowMs=60000){ const t=Date.now(); const bucket=rateBuckets.get(key); if(!bucket || t-bucket.start>=windowMs){rateBuckets.set(key,{start:t,count:1});return true;} bucket.count++; return bucket.count<=limit; }
 setInterval(()=>{const cutoff=Date.now()-600000;for(const [k,v] of rateBuckets)if(v.start<cutoff)rateBuckets.delete(k)},600000).unref();
@@ -109,7 +134,7 @@ app.use((req,res,next)=>{ if(req.path.startsWith('/api/auth/') && !rateLimit(`${
 const upload=multer({dest:path.join(DATA_DIR,'tmp'), limits:{fileSize:10*1024*1024}, fileFilter:(_req,file,cb)=>{ const ok=/^(application\/pdf|image\/(png|jpeg|webp))$/i.test(file.mimetype||''); cb(ok?null:new Error('Only PDF, PNG, JPG, or WEBP files are allowed.'),ok); }});
 fs.mkdirSync(path.join(DATA_DIR,'tmp'),{recursive:true});
 
-app.get('/api/health',(_req,res)=>res.json({ok:true,service:'ConnectID API',time:now(),storage:'json'}));
+app.get('/api/health',(_req,res)=>res.json({ok:true,service:'ConnectID API',time:now(),storage:'json',email:{mode:RESEND_ENABLED?'resend':'demo',configured:Boolean(RESEND_API_KEY),fromConfigured:Boolean(RESEND_FROM)}}));
 
 app.post('/api/auth/register',async(req,res)=>{
   try{
@@ -117,15 +142,18 @@ app.post('/api/auth/register',async(req,res)=>{
     if(!validateName(name)||!gmail(email)||!validateMobile(mobile)||password.length<8) return sendError(res,400,'Enter a valid name, Gmail address, mobile number, and password of at least 8 characters.');
     if(db.users.some(u=>u.email===email)) return sendError(res,409,'An account with this Gmail already exists.');
     const user={id:next('nextUserId'),person_id:personId(),name,email,mobile,password_hash:await bcrypt.hash(password,10),email_verified:0,created_at:now()};
-    db.users.push(user);
     const otp=String(crypto.randomInt(100000,1000000));
+    const pending={id:next('nextOtpId'),email,otp_hash:hashValue(otp),attempts:0,expires_at:Date.now()+OTP_TTL_MINUTES*60000,purpose:'register'};
+    const delivery=await sendOtpEmail({to:email,otp,purpose:'register',name});
+    db.users.push(user);
     db.pending_otps=db.pending_otps.filter(x=>!(x.email===email&&x.purpose==='register'));
-    const otpRowId=next('nextOtpId');
-    db.pending_otps.push({id:otpRowId,email,otp_hash:hashValue(otp),attempts:0,expires_at:Date.now()+OTP_TTL_MINUTES*60000,purpose:'register'});
+    db.pending_otps.push(pending);
     saveDb();
-    try { await sendOtpEmail(email, otp, 'verification'); } catch (e) { db.users=db.users.filter(x=>x.id!==user.id); db.pending_otps=db.pending_otps.filter(x=>x.id!==otpRowId); saveDb(); return sendError(res,502,'Unable to send verification email. Please check the Resend configuration.'); }
-    res.json({ok:true,email,personId:user.person_id,delivery:EMAIL_MODE==='resend'?'email':'demo',demoOtp:EMAIL_MODE==='demo'?otp:undefined});
-  }catch(e){ console.error(e); sendError(res,500,'Registration failed'); }
+    res.json({ok:true,email,personId:user.person_id,delivery:delivery.mode,demoOtp:delivery.mode==='demo'?otp:undefined});
+  }catch(e){
+    console.error('Registration email failed:', e);
+    return sendError(res,502,`Unable to send verification email. ${e.message || 'Please check the Resend configuration.'}`);
+  }
 });
 
 app.post('/api/auth/verify-email',(req,res)=>{
@@ -191,7 +219,17 @@ app.post('/api/access-requests/:id/decision',personAuth,async(req,res)=>{
   const decision=req.body.decision; const o=orgById(r.organization_id); if(r.status!=='Pending')return sendError(res,400,'This request is no longer pending.');
   if(decision==='deny'){r.status='Denied'; saveDb(); audit(r.person_id,'ACCESS_DENIED',`Denied request #${r.id}`,r.organization_id); notify(r.person_id,'Access request denied',`You denied ${o?.name||'the organization'} request #${r.id}.`); return res.json({ok:true,status:r.status});}
   if(decision!=='approve')return sendError(res,400,'Invalid decision');
-  const otp=String(crypto.randomInt(100000,1000000)); r.status='Awaiting OTP'; r.otp_hash=hashValue(otp); r.otp_attempts=0; r.otp_expires_at=Date.now()+OTP_TTL_MINUTES*60000; r.approved_at=now(); saveDb(); audit(r.person_id,'ACCESS_APPROVED',`Approved request #${r.id}`,r.organization_id); notify(r.person_id,'Access approved',`${o?.name||'Organization'} may complete OTP authorization for request #${r.id}.`); const person=db.users.find(u=>u.person_id===r.person_id); try { await sendOtpEmail(person.email, otp, 'access'); } catch(e) { r.status='Pending'; r.otp_hash=null; r.otp_expires_at=null; saveDb(); return sendError(res,502,'Unable to send approval OTP email. Please check the Resend configuration.'); } res.json({ok:true,status:r.status,delivery:EMAIL_MODE==='resend'?'email':'demo',demoOtp:EMAIL_MODE==='demo'?otp:undefined});
+  const user=findUserByPerson(r.person_id); if(!user)return sendError(res,404,'User not found');
+  const otp=String(crypto.randomInt(100000,1000000));
+  try{
+    const delivery=await sendOtpEmail({to:user.email,otp,purpose:'access',name:user.name});
+    r.status='Awaiting OTP'; r.otp_hash=hashValue(otp); r.otp_attempts=0; r.otp_expires_at=Date.now()+OTP_TTL_MINUTES*60000; r.approved_at=now();
+    saveDb(); audit(r.person_id,'ACCESS_APPROVED',`Approved request #${r.id}`,r.organization_id); notify(r.person_id,'Access approved',`${o?.name||'Organization'} may complete OTP authorization for request #${r.id}.`);
+    res.json({ok:true,status:r.status,delivery:delivery.mode,demoOtp:delivery.mode==='demo'?otp:undefined});
+  }catch(e){
+    console.error('Access OTP email failed:', e);
+    return sendError(res,502,`Unable to send access authorization email. ${e.message || 'Please check the Resend configuration.'}`);
+  }
 });
 app.post('/api/access-requests/:id/authorize',orgAuth,(req,res)=>{
   if(!rateLimit(`org-authorize:${req.auth.sub}`,30,60000)) return sendError(res,429,'Too many authorization attempts. Please try again shortly.');
@@ -225,5 +263,5 @@ await seed();
 app.use(express.static(__dirname));
 app.get('*',(req,res,nextFn)=>{if(req.path.startsWith('/api/'))return nextFn();res.sendFile(path.join(__dirname,'index.html'));});
 app.use((err,_req,res,_next)=>{ console.error(err); if(err instanceof multer.MulterError) return sendError(res,400,err.code==='LIMIT_FILE_SIZE'?'File exceeds the 10 MB limit.':'Upload failed.'); return sendError(res,400,err.message||'Request failed.'); });
-if(IS_PRODUCTION && process.env.EMAIL_MODE!=='demo' && !process.env.JWT_SECRET) console.warn('JWT_SECRET is not set; using the built-in demo fallback secret.');
+if(IS_PRODUCTION && !process.env.JWT_SECRET) console.warn('JWT_SECRET is not set; using the built-in demo fallback secret.');
 app.listen(PORT,'0.0.0.0',()=>console.log(`ConnectID API listening on ${PORT}; data=${DATA_DIR}`));
