@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: connectid
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "20.19.0"
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      - key: EMAIL_MODE
+        value: demo
+      - key: OTP_TTL_MINUTES
+        value: "10"
+      - key: DATA_DIR
+        value: /var/data
+    disk:
+      name: connectid-data
+      mountPath: /var/data
+      sizeGB: 1
